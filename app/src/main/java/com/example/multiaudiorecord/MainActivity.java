@@ -117,7 +117,7 @@ public class MainActivity extends AppCompatActivity {
 
         Log.i(TAG, "Start");
 
-        Snackbar snackBar = Snackbar.make(findViewById(R.id.mainConstraintLayout), "Start recording audio on " + mNumberOfTracks + " channels", 1);
+        Snackbar snackBar = Snackbar.make(findViewById(R.id.mainConstraintLayout), "Start recording audio on " + mNumberOfTracks + " channels", Snackbar.LENGTH_SHORT);
         snackBar.show();
 
         startRecording();
@@ -126,7 +126,7 @@ public class MainActivity extends AppCompatActivity {
     public void onStopButton(View view) {
         Log.i(TAG, "Stop");
 
-        Snackbar snackBar = Snackbar.make(findViewById(R.id.mainConstraintLayout), "Recording stopped. File saved to " + OUTPUT_FILENAME, 1);
+        Snackbar snackBar = Snackbar.make(findViewById(R.id.mainConstraintLayout), "Recording stopped. File saved to " + OUTPUT_FILENAME, Snackbar.LENGTH_SHORT);
         snackBar.show();
 
         stopRecording();
