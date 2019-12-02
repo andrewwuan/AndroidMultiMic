@@ -19,8 +19,11 @@ import android.os.Process;
 import android.util.Log;
 import android.view.View;
 
+import com.google.android.material.snackbar.Snackbar;
+
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.List;
 
 public class MainActivity extends AppCompatActivity {
@@ -30,14 +33,16 @@ public class MainActivity extends AppCompatActivity {
     private static final String MIME_TYPE = "audio/mp4a-latm";
     private static final int SAMPLE_RATE = 44100;	// 44.1[KHz] is only setting guaranteed to be available on all devices.
     private static final int BIT_RATE = 64000;
-    public static final int SAMPLES_PER_FRAME = 1024;	// AAC, bytes/frame/channel
-    public static final int FRAMES_PER_BUFFER = 25; 	// AAC, frame/buffer/sec
 
     protected static final int TIMEOUT_USEC = 10000;	// 10[msec]
+    protected static final String OUTPUT_FILENAME = "rec.mp4";
 
-    AudioRecord ar1, ar2, ar3, ar4;
+    // One media codec corresponds to one audio stream, but there is always only one muxer
+    int mNumberOfTracks = 1;
+    List<AudioRecord> mAudioRecords;
+    List<MediaCodec> mMediaCodecs;
     MediaMuxer mMediaMuxer;
-    MediaCodec mMediaCodec;
+
     MediaFormat mMediaFormat;
     MediaCodec.BufferInfo mBufferInfo;
     int mBufferSize;
@@ -63,34 +68,37 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    // Setup
     private void setup() throws IOException {
 
         if(!hasPermissions(this, PERMISSIONS)){
             ActivityCompat.requestPermissions(this, PERMISSIONS, 1);
         }
 
-        // Generate AudioRecord instances
-        mBufferSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
-        ar1 = audioRecordFactory(mBufferSize, 0);
-        List<MicrophoneInfo> mics = ar1.getActiveMicrophones();
-        Log.i(TAG, "There are " + mics.size() + " active microphones for ar1");
+        mAudioRecords = new ArrayList<>();
+        mMediaCodecs = new ArrayList<>();
 
-        // Generate codec
+        // Setup AudioRecord list
+        mBufferSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
+        for (int i = 0; i < mNumberOfTracks; i++) {
+            AudioRecord ar = new AudioRecord(i, SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, mBufferSize);
+            mAudioRecords.add(ar);
+            Log.i(TAG, "There are " + ar.getActiveMicrophones().size() + " active microphones for track " + i);
+        }
+
+        // Setup MediaCodec list
         mMediaFormat = MediaFormat.createAudioFormat(MIME_TYPE, SAMPLE_RATE, 1);
         mMediaFormat.setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC);
         mMediaFormat.setInteger(MediaFormat.KEY_CHANNEL_MASK, AudioFormat.CHANNEL_IN_MONO);
         mMediaFormat.setInteger(MediaFormat.KEY_BIT_RATE, BIT_RATE);
         mMediaFormat.setInteger(MediaFormat.KEY_CHANNEL_COUNT, 1);
-
-        Log.i(TAG, "format: " + mMediaFormat);
-        mMediaCodec = MediaCodec.createEncoderByType(MIME_TYPE);
-        mMediaCodec.configure(mMediaFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+        for (int i = 0; i < mNumberOfTracks; i++) {
+            MediaCodec mc = MediaCodec.createByCodecName(MIME_TYPE);
+            mc.configure(mMediaFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+        }
 
         // Generate muxer
-        mMediaMuxer = new MediaMuxer("rec.mp4", MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
-
-        // Misc
-        mBufferInfo = new MediaCodec.BufferInfo();
+        mMediaMuxer = new MediaMuxer(OUTPUT_FILENAME, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
     }
 
     public static boolean hasPermissions(Context context, String... permissions) {
@@ -104,49 +112,74 @@ public class MainActivity extends AppCompatActivity {
         return true;
     }
 
-    AudioRecord audioRecordFactory(int bufferSize, int audioSource) {
-        return new AudioRecord(audioSource, SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufferSize);
-    }
 
     public void onStartButton(View view) throws IOException {
 
         Log.i(TAG, "Start");
 
-        mIsCapturing = true;
+        Snackbar snackBar = Snackbar.make(findViewById(R.id.mainConstraintLayout), "Start recording audio on " + mNumberOfTracks + " channels", 1);
+        snackBar.show();
 
-        mMediaCodec.start();
+        startRecording();
+    }
+
+    public void onStopButton(View view) {
+        Log.i(TAG, "Stop");
+
+        Snackbar snackBar = Snackbar.make(findViewById(R.id.mainConstraintLayout), "Recording stopped. File saved to " + OUTPUT_FILENAME, 1);
+        snackBar.show();
+
+        stopRecording();
+    }
+
+    private void startRecording() {
+        mIsCapturing = true;
+        mIsEOS = false;
+    }
+
+    private void stopRecording() {
+
     }
 
     private class AudioThread extends Thread {
         @Override
         public void run() {
             android.os.Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
-            ByteBuffer buf = ByteBuffer.allocateDirect(SAMPLES_PER_FRAME);
+            ByteBuffer buf = ByteBuffer.allocateDirect(mBufferSize);
             int readBytes;
-            ar1.startRecording();
+            for (int i = 0; i < mNumberOfTracks; i++) {
+                mAudioRecords.get(i).startRecording();
+            }
+
             try {
                 for (; mIsCapturing && !mIsEOS; ) {
                     buf.clear();
-                    readBytes = ar1.read(buf, SAMPLES_PER_FRAME);
-                    if (readBytes > 0) {
-                        buf.position(readBytes);
-                        buf.flip();
-                        encode(buf, readBytes, getPTSUs());
-                        drain();
+                    for (int i = 0; i < mNumberOfTracks; i++) {
+                        readBytes = mAudioRecords.get(i).read(buf, mBufferSize);
+                        if (readBytes > 0) {
+                            buf.position(readBytes);
+                            buf.flip();
+                            encode(i, buf, readBytes, getPTSUs());
+                            drain(i);
+                        }
                     }
                 }
-                drain();
+                for (int i = 0; i < mNumberOfTracks; i++)
+                    drain(i);
             } finally {
-                ar1.stop();
+                for (int i = 0; i < mNumberOfTracks; i++) {
+                    mAudioRecords.get(i).stop();
+                }
             }
         }
     }
 
-    protected void drain() {
+    protected void drain(int index) {
+        MediaCodec mc = mMediaCodecs.get(index);
         while (mIsCapturing) {
-            int outputBufferIndex = mMediaCodec.dequeueOutputBuffer(mBufferInfo, TIMEOUT_USEC);
+            int outputBufferIndex = mc.dequeueOutputBuffer(mBufferInfo, TIMEOUT_USEC);
             if (outputBufferIndex >= 0) {
-                final ByteBuffer encodedData = mMediaCodec.getOutputBuffer(outputBufferIndex);
+                final ByteBuffer encodedData = mc.getOutputBuffer(outputBufferIndex);
                 if (encodedData == null) {
                     throw new RuntimeException("encoderOutputBuffer at " + outputBufferIndex + " is null");
                 }
@@ -157,7 +190,7 @@ public class MainActivity extends AppCompatActivity {
                     prevOutputPTSUs = mBufferInfo.presentationTimeUs;
                 }
 
-                mMediaCodec.releaseOutputBuffer(outputBufferIndex, false);
+                mc.releaseOutputBuffer(outputBufferIndex, false);
                 if ((mBufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
                     mIsCapturing = false;
                     break;
@@ -165,7 +198,7 @@ public class MainActivity extends AppCompatActivity {
             } else if (outputBufferIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
                 // do nothing
             } else if (outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                final MediaFormat format = mMediaCodec.getOutputFormat();
+                final MediaFormat format = mc.getOutputFormat();
                 mTrackIndex = mMediaMuxer.addTrack(format);
                 mMuxerStarted = true;
 
@@ -173,13 +206,14 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    protected void encode(final ByteBuffer buffer, final int length, final long presentationTimeUs) {
+    protected void encode(int index, final ByteBuffer buffer, final int length, final long presentationTimeUs) {
         if (!mIsCapturing) return;
+        MediaCodec mc = mMediaCodecs.get(index);
         while (mIsCapturing) {
-            int inputBufferIndex = mMediaCodec.dequeueInputBuffer(TIMEOUT_USEC);
+            int inputBufferIndex = mc.dequeueInputBuffer(TIMEOUT_USEC);
             if (inputBufferIndex >= 0) {
 
-                final ByteBuffer inputBuffer = mMediaCodec.getInputBuffer(inputBufferIndex);
+                final ByteBuffer inputBuffer = mc.getInputBuffer(inputBufferIndex);
                 inputBuffer.clear();
                 if (buffer != null) {
                     inputBuffer.put(buffer);
@@ -188,10 +222,10 @@ public class MainActivity extends AppCompatActivity {
                 if (length <= 0) {
                     // send EOS
                     mIsEOS = true;
-                    mMediaCodec.queueInputBuffer(inputBufferIndex, 0, 0,
+                    mc.queueInputBuffer(inputBufferIndex, 0, 0,
                             presentationTimeUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
                 } else {
-                    mMediaCodec.queueInputBuffer(inputBufferIndex, 0, length,
+                    mc.queueInputBuffer(inputBufferIndex, 0, length,
                             presentationTimeUs, 0);
                 }
 
@@ -199,11 +233,6 @@ public class MainActivity extends AppCompatActivity {
                 Log.e(TAG, "DequeueInputBuffer returns " + inputBufferIndex);
             }
         }
-    }
-
-    public void onStopButton(View view
-    ) {
-        Log.i(TAG, "Stop");
     }
 
     private long prevOutputPTSUs = 0;
