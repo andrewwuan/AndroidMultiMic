@@ -11,11 +11,14 @@ import android.media.AudioFormat;
 import android.media.AudioRecord;
 import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
+import android.media.MediaCodecList;
 import android.media.MediaFormat;
 import android.media.MediaMuxer;
 import android.media.MicrophoneInfo;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.Process;
+import android.util.ArrayMap;
 import android.util.Log;
 import android.view.View;
 
@@ -24,18 +27,21 @@ import com.google.android.material.snackbar.Snackbar;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 
 public class MainActivity extends AppCompatActivity {
 
     static final String TAG = "MultiAudioRecordMain";
 
     private static final String MIME_TYPE = "audio/mp4a-latm";
+    private static final String ENCODER_NAME = "OMX.google.aac.encoder";
     private static final int SAMPLE_RATE = 44100;	// 44.1[KHz] is only setting guaranteed to be available on all devices.
     private static final int BIT_RATE = 64000;
 
     protected static final int TIMEOUT_USEC = 10000;	// 10[msec]
-    protected static final String OUTPUT_FILENAME = "rec.mp4";
+    protected static final String OUTPUT_FILENAME = Environment.getExternalStorageDirectory() + "/rec.mp4";
 
     // One media codec corresponds to one audio stream, but there is always only one muxer
     int mNumberOfTracks = 1;
@@ -46,14 +52,18 @@ public class MainActivity extends AppCompatActivity {
     MediaFormat mMediaFormat;
     MediaCodec.BufferInfo mBufferInfo;
     int mBufferSize;
-    int mTrackIndex;
+    Map<Integer, Integer> mIndexTrackIndexMap;
 
     Boolean mIsCapturing = false;
     Boolean mIsEOS = true;
+    Boolean mRequestStop = false;
     Boolean mMuxerStarted = false;
+    AudioThread mAudioThread;
 
     String[] PERMISSIONS = {
-            Manifest.permission.RECORD_AUDIO
+            Manifest.permission.RECORD_AUDIO,
+            Manifest.permission.READ_EXTERNAL_STORAGE,
+            Manifest.permission.WRITE_EXTERNAL_STORAGE
     };
 
     @Override
@@ -77,6 +87,7 @@ public class MainActivity extends AppCompatActivity {
 
         mAudioRecords = new ArrayList<>();
         mMediaCodecs = new ArrayList<>();
+        mIndexTrackIndexMap = new ArrayMap<>();
 
         // Setup AudioRecord list
         mBufferSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
@@ -92,9 +103,19 @@ public class MainActivity extends AppCompatActivity {
         mMediaFormat.setInteger(MediaFormat.KEY_CHANNEL_MASK, AudioFormat.CHANNEL_IN_MONO);
         mMediaFormat.setInteger(MediaFormat.KEY_BIT_RATE, BIT_RATE);
         mMediaFormat.setInteger(MediaFormat.KEY_CHANNEL_COUNT, 1);
+
+        MediaCodecList mcl = new MediaCodecList(MediaCodecList.ALL_CODECS);
+        MediaCodecInfo[] infos = mcl.getCodecInfos();
+        for (MediaCodecInfo info: infos) {
+            if (info.isEncoder()) {
+                Log.i(TAG, info.getName() + ", " + Arrays.toString(info.getSupportedTypes()));
+            }
+        }
+
         for (int i = 0; i < mNumberOfTracks; i++) {
-            MediaCodec mc = MediaCodec.createByCodecName(MIME_TYPE);
+            MediaCodec mc = MediaCodec.createByCodecName(ENCODER_NAME);
             mc.configure(mMediaFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+            mMediaCodecs.add(mc);
         }
 
         // Generate muxer
@@ -112,13 +133,8 @@ public class MainActivity extends AppCompatActivity {
         return true;
     }
 
-
-    public void onStartButton(View view) throws IOException {
-
+    public void onStartButton(View view) {
         Log.i(TAG, "Start");
-
-        Snackbar snackBar = Snackbar.make(findViewById(R.id.mainConstraintLayout), "Start recording audio on " + mNumberOfTracks + " channels", Snackbar.LENGTH_SHORT);
-        snackBar.show();
 
         startRecording();
     }
@@ -126,19 +142,40 @@ public class MainActivity extends AppCompatActivity {
     public void onStopButton(View view) {
         Log.i(TAG, "Stop");
 
-        Snackbar snackBar = Snackbar.make(findViewById(R.id.mainConstraintLayout), "Recording stopped. File saved to " + OUTPUT_FILENAME, Snackbar.LENGTH_SHORT);
-        snackBar.show();
-
         stopRecording();
     }
 
     private void startRecording() {
+        if (mIsCapturing) {
+            showSnackBar("Recording in progress!");
+            return;
+        }
+        showSnackBar("Start recording audio on " + mNumberOfTracks + " channels");
         mIsCapturing = true;
         mIsEOS = false;
+        mRequestStop = false;
+
+        mAudioThread = new AudioThread();
+        mAudioThread.start();
+    }
+
+    private void showSnackBar(String message) {
+        Snackbar snackBar = Snackbar.make(findViewById(R.id.mainConstraintLayout), message, Snackbar.LENGTH_SHORT);
+        snackBar.show();
     }
 
     private void stopRecording() {
-
+        if (mRequestStop) {
+            if (mIsCapturing) {
+                showSnackBar("Stop already requested!");
+            }
+            else {
+                showSnackBar("Recording not in progress");
+            }
+            return;
+        }
+        showSnackBar("Request stop recording");
+        mRequestStop = true;
     }
 
     private class AudioThread extends Thread {
@@ -149,27 +186,60 @@ public class MainActivity extends AppCompatActivity {
             int readBytes;
             for (int i = 0; i < mNumberOfTracks; i++) {
                 mAudioRecords.get(i).startRecording();
+                mMediaCodecs.get(i).start();
             }
 
-            try {
-                for (; mIsCapturing && !mIsEOS; ) {
-                    buf.clear();
-                    for (int i = 0; i < mNumberOfTracks; i++) {
-                        readBytes = mAudioRecords.get(i).read(buf, mBufferSize);
-                        if (readBytes > 0) {
-                            buf.position(readBytes);
-                            buf.flip();
-                            encode(i, buf, readBytes, getPTSUs());
-                            drain(i);
-                        }
+            while (!mRequestStop) {
+                buf.clear();
+                for (int i = 0; i < mNumberOfTracks; i++) {
+                    readBytes = mAudioRecords.get(i).read(buf, mBufferSize);
+                    if (readBytes > 0) {
+                        buf.position(readBytes);
+                        buf.flip();
+                        encode(i, buf, readBytes, getPTSUs());
+                        drain(i);
                     }
                 }
-                for (int i = 0; i < mNumberOfTracks; i++)
-                    drain(i);
-            } finally {
-                for (int i = 0; i < mNumberOfTracks; i++) {
-                    mAudioRecords.get(i).stop();
+            }
+            // Request stop, send EOF
+            for (int i = 0; i < mNumberOfTracks; i++) {
+                encode(i, null, 0, getPTSUs());
+                drain(i);
+                mAudioRecords.get(i).stop();
+                mMediaCodecs.get(i).stop();
+            }
+            mMediaMuxer.stop();
+        }
+    }
+
+    protected void encode(int index, final ByteBuffer buffer, final int length, final long presentationTimeUs) {
+        MediaCodec mc = mMediaCodecs.get(index);
+        while (mIsCapturing) {
+            int inputBufferIndex = mc.dequeueInputBuffer(TIMEOUT_USEC);
+            if (inputBufferIndex >= 0) {
+                final ByteBuffer inputBuffer = mc.getInputBuffer(inputBufferIndex);
+                if (inputBuffer == null) {
+                    Log.e(TAG, "getInputBuffer returns null");
+                    continue;
                 }
+                inputBuffer.clear();
+
+                if (buffer != null) {
+                    inputBuffer.put(buffer);
+                }
+
+                if (length <= 0) {
+                    // send EOS
+                    mIsEOS = true;
+                    mc.queueInputBuffer(inputBufferIndex, 0, 0,
+                            presentationTimeUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+                } else {
+                    mc.queueInputBuffer(inputBufferIndex, 0, length,
+                            presentationTimeUs, 0);
+                }
+                break;
+            } else if (inputBufferIndex != MediaCodec.INFO_TRY_AGAIN_LATER) {
+                Log.e(TAG, "DequeueInputBuffer returns " + inputBufferIndex);
             }
         }
     }
@@ -186,7 +256,7 @@ public class MainActivity extends AppCompatActivity {
 
                 if (mBufferInfo.size != 0) {
                     mBufferInfo.presentationTimeUs = getPTSUs();
-                    mMediaMuxer.writeSampleData(mTrackIndex, encodedData, mBufferInfo);
+                    mMediaMuxer.writeSampleData(mIndexTrackIndexMap.get(index), encodedData, mBufferInfo);
                     prevOutputPTSUs = mBufferInfo.presentationTimeUs;
                 }
 
@@ -197,40 +267,15 @@ public class MainActivity extends AppCompatActivity {
                 }
             } else if (outputBufferIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
                 // do nothing
+                Log.i(TAG, "dequeueOutputBuffer: Try again later");
             } else if (outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                if (mMuxerStarted) {
+                    Log.e(TAG, "Muxer started multiple times");
+                }
                 final MediaFormat format = mc.getOutputFormat();
-                mTrackIndex = mMediaMuxer.addTrack(format);
+                mIndexTrackIndexMap.put(index, mMediaMuxer.addTrack(format));
+                mMediaMuxer.start();
                 mMuxerStarted = true;
-
-            }
-        }
-    }
-
-    protected void encode(int index, final ByteBuffer buffer, final int length, final long presentationTimeUs) {
-        if (!mIsCapturing) return;
-        MediaCodec mc = mMediaCodecs.get(index);
-        while (mIsCapturing) {
-            int inputBufferIndex = mc.dequeueInputBuffer(TIMEOUT_USEC);
-            if (inputBufferIndex >= 0) {
-
-                final ByteBuffer inputBuffer = mc.getInputBuffer(inputBufferIndex);
-                inputBuffer.clear();
-                if (buffer != null) {
-                    inputBuffer.put(buffer);
-                }
-
-                if (length <= 0) {
-                    // send EOS
-                    mIsEOS = true;
-                    mc.queueInputBuffer(inputBufferIndex, 0, 0,
-                            presentationTimeUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
-                } else {
-                    mc.queueInputBuffer(inputBufferIndex, 0, length,
-                            presentationTimeUs, 0);
-                }
-
-            } else if (inputBufferIndex != MediaCodec.INFO_TRY_AGAIN_LATER) {
-                Log.e(TAG, "DequeueInputBuffer returns " + inputBufferIndex);
             }
         }
     }
