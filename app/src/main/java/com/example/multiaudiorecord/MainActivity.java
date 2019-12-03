@@ -50,9 +50,9 @@ public class MainActivity extends AppCompatActivity {
     MediaMuxer mMediaMuxer;
 
     MediaFormat mMediaFormat;
-    MediaCodec.BufferInfo mBufferInfo;
     int mBufferSize;
     Map<Integer, Integer> mIndexTrackIndexMap;
+    Map<Integer, MediaCodec.BufferInfo> mIndexBufferInfoMap;
 
     Boolean mIsCapturing = false;
     Boolean mIsEOS = true;
@@ -88,6 +88,7 @@ public class MainActivity extends AppCompatActivity {
         mAudioRecords = new ArrayList<>();
         mMediaCodecs = new ArrayList<>();
         mIndexTrackIndexMap = new ArrayMap<>();
+        mIndexBufferInfoMap = new ArrayMap<>();
 
         // Setup AudioRecord list
         mBufferSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
@@ -116,6 +117,7 @@ public class MainActivity extends AppCompatActivity {
             MediaCodec mc = MediaCodec.createByCodecName(ENCODER_NAME);
             mc.configure(mMediaFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
             mMediaCodecs.add(mc);
+            mIndexBufferInfoMap.put(i, new MediaCodec.BufferInfo());
         }
 
         // Generate muxer
@@ -196,6 +198,7 @@ public class MainActivity extends AppCompatActivity {
                     if (readBytes > 0) {
                         buf.position(readBytes);
                         buf.flip();
+                        Log.i(TAG, "read(): Write " + readBytes + " bytes");
                         encode(i, buf, readBytes, getPTSUs());
                         drain(i);
                     }
@@ -203,6 +206,7 @@ public class MainActivity extends AppCompatActivity {
             }
             // Request stop, send EOF
             for (int i = 0; i < mNumberOfTracks; i++) {
+                Log.i(TAG, "Stopping");
                 encode(i, null, 0, getPTSUs());
                 drain(i);
                 mAudioRecords.get(i).stop();
@@ -234,6 +238,7 @@ public class MainActivity extends AppCompatActivity {
                     mc.queueInputBuffer(inputBufferIndex, 0, 0,
                             presentationTimeUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
                 } else {
+                    Log.i(TAG, "Queueing input buffer");
                     mc.queueInputBuffer(inputBufferIndex, 0, length,
                             presentationTimeUs, 0);
                 }
@@ -245,29 +250,34 @@ public class MainActivity extends AppCompatActivity {
     }
 
     protected void drain(int index) {
+        int count = 0;
         MediaCodec mc = mMediaCodecs.get(index);
+        MediaCodec.BufferInfo bi = mIndexBufferInfoMap.get(index);
         while (mIsCapturing) {
-            int outputBufferIndex = mc.dequeueOutputBuffer(mBufferInfo, TIMEOUT_USEC);
+            int outputBufferIndex = mc.dequeueOutputBuffer(bi, TIMEOUT_USEC);
             if (outputBufferIndex >= 0) {
                 final ByteBuffer encodedData = mc.getOutputBuffer(outputBufferIndex);
                 if (encodedData == null) {
                     throw new RuntimeException("encoderOutputBuffer at " + outputBufferIndex + " is null");
                 }
 
-                if (mBufferInfo.size != 0) {
-                    mBufferInfo.presentationTimeUs = getPTSUs();
-                    mMediaMuxer.writeSampleData(mIndexTrackIndexMap.get(index), encodedData, mBufferInfo);
-                    prevOutputPTSUs = mBufferInfo.presentationTimeUs;
+                if (bi.size != 0) {
+                    Log.i(TAG, "drain(): Writing encodedData");
+                    bi.presentationTimeUs = getPTSUs();
+                    mMediaMuxer.writeSampleData(mIndexTrackIndexMap.get(index), encodedData, bi);
+                    prevOutputPTSUs = bi.presentationTimeUs;
                 }
 
                 mc.releaseOutputBuffer(outputBufferIndex, false);
-                if ((mBufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                if ((bi.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
                     mIsCapturing = false;
                     break;
                 }
             } else if (outputBufferIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
-                // do nothing
-                Log.i(TAG, "dequeueOutputBuffer: Try again later");
+                if (!mIsEOS) {
+                    if (++count > 5)
+                        break;		// out of while
+                }
             } else if (outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                 if (mMuxerStarted) {
                     Log.e(TAG, "Muxer started multiple times");
@@ -276,6 +286,7 @@ public class MainActivity extends AppCompatActivity {
                 mIndexTrackIndexMap.put(index, mMediaMuxer.addTrack(format));
                 mMediaMuxer.start();
                 mMuxerStarted = true;
+                Log.i(TAG, "Muxer started");
             }
         }
     }
